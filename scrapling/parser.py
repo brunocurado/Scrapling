@@ -1178,6 +1178,458 @@ class Selector(SelectorsGeneration):
                 return results[0]
         return results
 
+    # ── Pagination Auto-Detection ──────────────────────────────────────
+    # Common text patterns that indicate "next page" links across many languages
+    _NEXT_PAGE_TEXT_PATTERNS: Tuple[str, ...] = (
+        "next", "next page", "next »", "next ›", "next →",
+        "»", "›", "→", ">>", "▸", "▶",
+        # Portuguese
+        "próxima", "próximo", "seguinte", "próxima página",
+        # Spanish
+        "siguiente", "siguiente página",
+        # French
+        "suivant", "suivante", "page suivante",
+        # German
+        "weiter", "nächste", "nächste seite",
+        # Italian
+        "successivo", "prossimo", "pagina successiva",
+        # Japanese / Chinese
+        "次へ", "次のページ", "下一页", "下一頁",
+        # Arabic
+        "التالي", "الصفحة التالية",
+    )
+
+    # CSS class/id substrings that commonly indicate pagination "next" links
+    _NEXT_PAGE_CSS_SIGNALS: Tuple[str, ...] = (
+        "next", "pagination-next", "page-next", "pager-next",
+        "nav-next", "arrow-next", "btn-next",
+    )
+
+    # URL patterns that suggest pagination parameters
+    _PAGINATION_URL_PATTERNS: Tuple[str, ...] = (
+        "page=", "/page/", "p=", "offset=", "start=",
+        "pg=", "pagina=", "pag=",
+    )
+
+    def detect_next_page(self) -> Optional["Selector"]:
+        """Automatically detect the "Next Page" link in the current page.
+
+        Uses a multi-signal heuristic approach:
+        1. First checks for ``<link rel="next">`` (highest priority — set by site authors).
+        2. Scans all ``<a>`` tags and scores them based on:
+           - Text content matching common "next" patterns (multilingual).
+           - CSS class/id matching common pagination class names.
+           - ``rel="next"`` attribute on ``<a>`` tags.
+           - ``href`` containing URL pagination parameters.
+        3. Returns the highest-scoring candidate as a ``Selector``, or ``None`` if no
+           pagination link is found.
+
+        :return: A ``Selector`` wrapping the best "next page" ``<a>`` element, or ``None``.
+
+        Usage::
+
+            page = Fetcher.get('https://example.com/products?page=1')
+            next_link = page.detect_next_page()
+            if next_link:
+                next_url = page.urljoin(next_link.attrib['href'])
+        """
+        if self._is_text_node(self._root):
+            return None
+
+        # ── Signal 1: <link rel="next" href="..."> — highest confidence ──
+        link_next = self._root.xpath('//link[@rel="next" and @href]')
+        if link_next:
+            return self.__element_convertor(link_next[0])
+
+        # ── Signal 2: Score all <a> tags ──
+        all_anchors = self._root.xpath("//a[@href]")
+        if not all_anchors:
+            return None
+
+        best_score: float = 0.0
+        best_element: Optional[HtmlElement] = None
+        min_threshold: float = 1.0  # Minimum score to accept a candidate
+
+        for anchor in all_anchors:
+            score: float = 0.0
+            href = str(anchor.get("href", ""))
+
+            # Skip empty, javascript, and anchor-only links
+            if not href or href.startswith(("#", "javascript:", "mailto:")):
+                continue
+
+            # ── Text signal ──
+            # Get combined text content (including children like <span>Next</span>)
+            anchor_text = (anchor.text_content() or "").strip().lower()
+            if anchor_text:
+                for pattern in self._NEXT_PAGE_TEXT_PATTERNS:
+                    if pattern in anchor_text:
+                        # Exact single-symbol matches (», ›, →) get higher score
+                        if anchor_text == pattern:
+                            score += 5.0
+                        else:
+                            score += 3.0
+                        break
+
+            # ── rel="next" attribute on <a> ──
+            rel = str(anchor.get("rel", "")).lower()
+            if "next" in rel:
+                score += 6.0
+
+            # ── aria-label signal ──
+            aria = str(anchor.get("aria-label", "")).lower()
+            if aria:
+                for pattern in self._NEXT_PAGE_TEXT_PATTERNS:
+                    if pattern in aria:
+                        score += 4.0
+                        break
+
+            # ── title attribute signal ──
+            title = str(anchor.get("title", "")).lower()
+            if title:
+                for pattern in self._NEXT_PAGE_TEXT_PATTERNS:
+                    if pattern in title:
+                        score += 2.0
+                        break
+
+            # ── Class / ID signal ──
+            classes = str(anchor.get("class", "")).lower()
+            el_id = str(anchor.get("id", "")).lower()
+            # Also check parent element classes (common: <li class="next"><a>...)
+            parent = anchor.getparent()
+            parent_classes = str(parent.get("class", "")).lower() if parent is not None else ""
+            parent_id = str(parent.get("id", "")).lower() if parent is not None else ""
+            combined_css = f"{classes} {el_id} {parent_classes} {parent_id}"
+
+            for signal in self._NEXT_PAGE_CSS_SIGNALS:
+                if signal in combined_css:
+                    score += 3.0
+                    break
+
+            # Negative signal: "prev", "previous", "back", "disabled"
+            if any(neg in combined_css for neg in ("prev", "previous", "back", "disabled", "anterior")):
+                score -= 10.0
+
+            if any(neg in anchor_text for neg in ("prev", "previous", "back", "anterior")):
+                score -= 10.0
+
+            # ── URL pattern signal ──
+            href_lower = href.lower()
+            for url_pat in self._PAGINATION_URL_PATTERNS:
+                if url_pat in href_lower:
+                    score += 1.0
+                    break
+
+            # ── Pick the best candidate ──
+            if score > best_score:
+                best_score = score
+                best_element = anchor
+
+        if best_element is not None and best_score >= min_threshold:
+            return self.__element_convertor(best_element)
+
+        return None
+
+    # ── Schema Auto-Detection ──────────────────────────────────────────
+
+    def get_schemas(self) -> Dict[str, List]:
+        """Auto-detect and extract structured data schemas from the page.
+
+        Extracts three types of structured data:
+
+        1. **JSON-LD**: ``<script type="application/ld+json">`` tags, parsed into dicts.
+        2. **Microdata**: Elements with ``itemscope``/``itemprop`` attributes, extracted
+           into nested dictionaries with ``@type`` and property values.
+        3. **RDFa**: Elements with ``vocab``/``typeof``/``property`` attributes, extracted
+           similarly.
+
+        :return: A dictionary with three keys: ``json_ld``, ``microdata``, and ``rdfa``,
+                 each containing a list of the extracted schema objects.
+
+        Usage::
+
+            page = Fetcher.get('https://example.com/product')
+            schemas = page.get_schemas()
+            for item in schemas['json_ld']:
+                print(item.get('@type'), item.get('name'))
+        """
+        if self._is_text_node(self._root):
+            return {"json_ld": [], "microdata": [], "rdfa": []}
+
+        result: Dict[str, List] = {"json_ld": [], "microdata": [], "rdfa": []}
+
+        # ── 1. JSON-LD ──
+        try:
+            import orjson
+            _json_loads = orjson.loads
+        except ImportError:
+            import json
+            _json_loads = json.loads
+
+        for script in self._root.xpath('//script[@type="application/ld+json"]'):
+            raw_text = script.text_content()
+            if raw_text and raw_text.strip():
+                try:
+                    data = _json_loads(raw_text.strip())
+                    if isinstance(data, list):
+                        result["json_ld"].extend(data)
+                    else:
+                        result["json_ld"].append(data)
+                except (ValueError, TypeError):
+                    pass  # Malformed JSON-LD, skip silently
+
+        # ── 2. Microdata ──
+        # Find all top-level itemscope elements (not nested inside another itemscope)
+        for item_el in self._root.xpath("//*[@itemscope]"):
+            item_data = self.__extract_microdata_item(item_el)
+            if item_data:
+                result["microdata"].append(item_data)
+
+        # ── 3. RDFa ──
+        for rdfa_el in self._root.xpath("//*[@vocab or @typeof]"):
+            rdfa_data = self.__extract_rdfa_item(rdfa_el)
+            if rdfa_data:
+                result["rdfa"].append(rdfa_data)
+
+        return result
+
+    def __extract_microdata_item(self, element: HtmlElement) -> Dict[str, Any]:
+        """Extract a single Microdata item (itemscope) into a dictionary.
+
+        :param element: An lxml HtmlElement with ``itemscope`` attribute.
+        :return: A dictionary with ``@type``, ``@id`` and property values.
+        """
+        item: Dict[str, Any] = {}
+
+        item_type = element.get("itemtype", "")
+        if item_type:
+            item["@type"] = item_type
+
+        item_id = element.get("itemid", "")
+        if item_id:
+            item["@id"] = item_id
+
+        # Collect itemprop elements that are direct descendants (not inside nested itemscopes)
+        for prop_el in element.xpath(".//*[@itemprop]"):
+            # Skip if this prop_el belongs to a nested itemscope
+            ancestors_with_scope = prop_el.xpath("ancestor::*[@itemscope]")
+            if len(ancestors_with_scope) > 1 and ancestors_with_scope[0] != element:
+                continue
+
+            prop_name = prop_el.get("itemprop", "")
+            if not prop_name:
+                continue
+
+            # Determine the value
+            if prop_el.get("itemscope") is not None:
+                # Nested item
+                value = self.__extract_microdata_item(prop_el)
+            elif prop_el.tag in ("meta",):
+                value = prop_el.get("content", "")
+            elif prop_el.tag in ("a", "area", "link"):
+                value = prop_el.get("href", "")
+            elif prop_el.tag in ("img", "video", "audio", "source", "embed"):
+                value = prop_el.get("src", "")
+            elif prop_el.tag in ("time",):
+                value = prop_el.get("datetime", prop_el.text_content() or "")
+            elif prop_el.tag in ("data", "meter"):
+                value = prop_el.get("value", prop_el.text_content() or "")
+            else:
+                value = (prop_el.text_content() or "").strip()
+
+            # Handle multiple values for the same property
+            if prop_name in item:
+                existing = item[prop_name]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    item[prop_name] = [existing, value]
+            else:
+                item[prop_name] = value
+
+        return item
+
+    def __extract_rdfa_item(self, element: HtmlElement) -> Dict[str, Any]:
+        """Extract a single RDFa item into a dictionary.
+
+        :param element: An lxml HtmlElement with ``vocab`` or ``typeof`` attribute.
+        :return: A dictionary with ``@vocab``, ``@typeof`` and property values.
+        """
+        item: Dict[str, Any] = {}
+
+        vocab = element.get("vocab", "")
+        if vocab:
+            item["@vocab"] = vocab
+
+        typeof = element.get("typeof", "")
+        if typeof:
+            item["@typeof"] = typeof
+
+        resource = element.get("resource", "")
+        if resource:
+            item["@resource"] = resource
+
+        for prop_el in element.xpath(".//*[@property]"):
+            prop_name = prop_el.get("property", "")
+            if not prop_name:
+                continue
+
+            # Get value from content attribute or text
+            if prop_el.get("content") is not None:
+                value = prop_el.get("content", "")
+            elif prop_el.tag in ("a", "link"):
+                value = prop_el.get("href", "")
+            elif prop_el.tag in ("img",):
+                value = prop_el.get("src", "")
+            elif prop_el.tag in ("time",):
+                value = prop_el.get("datetime", prop_el.text_content() or "")
+            else:
+                value = (prop_el.text_content() or "").strip()
+
+            if prop_name in item:
+                existing = item[prop_name]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    item[prop_name] = [existing, value]
+            else:
+                item[prop_name] = value
+
+        return item
+
+    # ── Meta Analyzer ──────────────────────────────────────────────────
+
+    def analyze(self) -> Dict[str, Any]:
+        """Analyze the page's meta-elements and return a structured profile.
+
+        Extracts:
+        - ``title``: The page ``<title>`` text.
+        - ``description``: Content of ``<meta name="description">``.
+        - ``keywords``: Content of ``<meta name="keywords">`` (as a list).
+        - ``canonical``: The canonical URL from ``<link rel="canonical">``.
+        - ``language``: The page language from ``<html lang="...">``.
+        - ``opengraph``: Dict of all ``og:*`` meta properties.
+        - ``twitter``: Dict of all ``twitter:*`` meta properties.
+        - ``author``: Content of ``<meta name="author">``.
+        - ``robots``: Content of ``<meta name="robots">``.
+        - ``generator``: Content of ``<meta name="generator">``.
+        - ``favicon``: URL of the favicon (``<link rel="icon">``).
+        - ``feeds``: List of RSS/Atom feed URLs.
+        - ``charset``: Character encoding declared in meta.
+        - ``viewport``: Viewport meta content.
+
+        :return: A dictionary with the extracted metadata.
+
+        Usage::
+
+            page = Fetcher.get('https://example.com')
+            meta = page.analyze()
+            print(meta['title'], meta['opengraph'].get('og:image'))
+        """
+        if self._is_text_node(self._root):
+            return {}
+
+        result: Dict[str, Any] = {
+            "title": None,
+            "description": None,
+            "keywords": [],
+            "canonical": None,
+            "language": None,
+            "opengraph": {},
+            "twitter": {},
+            "author": None,
+            "robots": None,
+            "generator": None,
+            "favicon": None,
+            "feeds": [],
+            "charset": None,
+            "viewport": None,
+        }
+
+        # ── Title ──
+        title_els = self._root.xpath("//title")
+        if title_els:
+            result["title"] = (title_els[0].text_content() or "").strip()
+
+        # ── HTML lang ──
+        html_els = self._root.xpath("//html[@lang]")
+        if html_els:
+            result["language"] = html_els[0].get("lang", "").strip()
+
+        # ── Charset ──
+        charset_els = self._root.xpath("//meta[@charset]")
+        if charset_els:
+            result["charset"] = charset_els[0].get("charset", "").strip()
+        else:
+            # Fallback: <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+            ct_els = self._root.xpath('//meta[@http-equiv="Content-Type"]')
+            if ct_els:
+                content = ct_els[0].get("content", "")
+                if "charset=" in content:
+                    result["charset"] = content.split("charset=")[-1].strip()
+
+        # ── Canonical URL ──
+        canonical_els = self._root.xpath('//link[@rel="canonical" and @href]')
+        if canonical_els:
+            result["canonical"] = canonical_els[0].get("href", "").strip()
+
+        # ── Favicon ──
+        for rel_val in ("icon", "shortcut icon"):
+            favicon_els = self._root.xpath(f'//link[contains(@rel, "{rel_val}") and @href]')
+            if favicon_els:
+                result["favicon"] = favicon_els[0].get("href", "").strip()
+                break
+
+        # ── RSS/Atom feeds ──
+        feed_els = self._root.xpath(
+            '//link[@type="application/rss+xml" or @type="application/atom+xml"]'
+        )
+        for feed in feed_els:
+            feed_info = {
+                "title": feed.get("title", ""),
+                "href": feed.get("href", ""),
+                "type": feed.get("type", ""),
+            }
+            result["feeds"].append(feed_info)
+
+        # ── Standard meta tags ──
+        _name_meta_map = {
+            "description": "description",
+            "keywords": "keywords",
+            "author": "author",
+            "robots": "robots",
+            "generator": "generator",
+            "viewport": "viewport",
+        }
+        for meta_el in self._root.xpath("//meta[@name and @content]"):
+            name = (meta_el.get("name", "") or "").lower().strip()
+            content = (meta_el.get("content", "") or "").strip()
+            if name in _name_meta_map and content:
+                key = _name_meta_map[name]
+                if key == "keywords":
+                    result["keywords"] = [k.strip() for k in content.split(",") if k.strip()]
+                else:
+                    result[key] = content
+
+        # ── OpenGraph (og:*) ──
+        for meta_el in self._root.xpath('//meta[starts-with(@property, "og:")]'):
+            prop = meta_el.get("property", "").strip()
+            content = (meta_el.get("content", "") or "").strip()
+            if prop and content:
+                result["opengraph"][prop] = content
+
+        # ── Twitter Cards (twitter:*) ──
+        for meta_el in self._root.xpath(
+            '//meta[starts-with(@name, "twitter:") or starts-with(@property, "twitter:")]'
+        ):
+            prop = (meta_el.get("name", "") or meta_el.get("property", "") or "").strip()
+            content = (meta_el.get("content", "") or "").strip()
+            if prop and content:
+                result["twitter"][prop] = content
+
+        return result
+
+
 
 class Selectors(List[Selector]):
     """
@@ -1352,6 +1804,111 @@ class Selectors(List[Selector]):
     def length(self) -> int:
         """Returns the length of the current list"""
         return len(self)
+
+    # ── Regex Generation ───────────────────────────────────────────────
+
+    def generate_regex(
+        self,
+        attribute: str = "href",
+        use_text: bool = False,
+    ) -> Optional[str]:
+        """Generate a regex pattern from a group of elements.
+
+        Analyzes the given attribute (or text content) of all elements in this
+        list and produces a regular expression that matches all of them by
+        finding common prefixes, suffixes, and variable segments.
+
+        Useful for dynamic content extraction where the structure changes but the
+        URL/text pattern remains similar.
+
+        :param attribute: The attribute to extract values from (default: ``href``).
+        :param use_text: If True, use the text content of elements instead of an attribute.
+        :return: A regex pattern string, or ``None`` if the list has fewer than 2 elements.
+
+        Usage::
+
+            links = page.css('div.products a')
+            pattern = links.generate_regex(attribute='href')
+            # e.g. r'/products/\\d+/[^/]+'
+        """
+        import re
+        from os.path import commonprefix
+
+        # Collect values
+        values: list[str] = []
+        for el in self:
+            if use_text:
+                val = str(el.text or "").strip()
+            else:
+                val = str(el.attrib.get(attribute, "")).strip()
+            if val:
+                values.append(val)
+
+        if len(values) < 2:
+            return None
+
+        # ── Find common prefix ──
+        prefix = commonprefix(values)
+
+        # ── Find common suffix ──
+        reversed_values = [v[::-1] for v in values]
+        suffix = commonprefix(reversed_values)[::-1]
+
+        # Avoid prefix/suffix overlap
+        if prefix and suffix and len(prefix) + len(suffix) > len(values[0]):
+            suffix = ""
+
+        # ── Analyze the variable parts ──
+        variable_parts: list[str] = []
+        for v in values:
+            start = len(prefix)
+            end = len(v) - len(suffix) if suffix else len(v)
+            variable_parts.append(v[start:end])
+
+        # ── Detect the type of variable content ──
+        all_numeric = all(p.isdigit() for p in variable_parts if p)
+        all_have_slashes = all("/" in p for p in variable_parts if p)
+
+        if not any(variable_parts):
+            # All values are identical
+            return re.escape(values[0])
+
+        # Build the regex for the variable segment
+        if all_numeric:
+            var_pattern = r"\d+"
+        elif all_have_slashes:
+            # Multi-segment paths: replace each segment
+            max_segments = max(len(p.split("/")) for p in variable_parts)
+            segments = []
+            for i in range(max_segments):
+                seg_values = set()
+                for p in variable_parts:
+                    parts = p.split("/")
+                    if i < len(parts):
+                        seg_values.add(parts[i])
+
+                if all(s.isdigit() for s in seg_values if s):
+                    segments.append(r"\d+")
+                elif len(seg_values) <= 3 and all(s for s in seg_values):
+                    # Few distinct values — use alternation
+                    segments.append("(?:" + "|".join(re.escape(s) for s in sorted(seg_values)) + ")")
+                else:
+                    segments.append("[^/]+")
+            var_pattern = "/".join(segments)
+        else:
+            # Check if variable parts share a sub-pattern
+            if len(set(len(p) for p in variable_parts)) == 1 and len(variable_parts[0]) <= 4:
+                # Fixed-length short strings (like codes)
+                var_pattern = ".{" + str(len(variable_parts[0])) + "}"
+            elif all(re.match(r'^[a-zA-Z0-9_-]+$', p) for p in variable_parts if p):
+                var_pattern = r"[a-zA-Z0-9_-]+"
+            else:
+                var_pattern = ".+?"
+
+        # ── Assemble the final regex ──
+        pattern = re.escape(prefix) + "(" + var_pattern + ")" + re.escape(suffix)
+
+        return pattern
 
     def __getstate__(self) -> Any:  # pragma: no cover
         # lxml don't like it :)
